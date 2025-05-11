@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2024, Brandon Lehmann <brandonlehmann@gmail.com>
+// Copyright (c) 2018-2025, Brandon Lehmann <brandonlehmann@gmail.com>
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -18,15 +18,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-import { createSocket, RemoteInfo, Socket, SocketType } from 'dgram';
+import { createSocket, RemoteInfo, Socket, SocketType, SocketOptions } from 'dgram';
 import { AddressInfo } from 'net';
 import { EventEmitter } from 'events';
 import { detect_type, compare_IP_addresses, get_addresses, is_valid_ip } from './helpers';
-import { MulticastOptions, SendOptions } from './types';
 
-export * from './types';
-
-export default class MulticastSocket extends EventEmitter {
+export class MulticastSocket extends EventEmitter {
     private readonly socket: Socket;
     private readonly type: SocketType;
 
@@ -48,7 +45,7 @@ export default class MulticastSocket extends EventEmitter {
      *
      * @param multicastOptions
      */
-    constructor (private readonly multicastOptions: MulticastOptions) {
+    constructor (private readonly multicastOptions: MulticastSocket.Options) {
         super();
 
         this.multicastOptions.reuseAddr ??= true;
@@ -147,7 +144,7 @@ export default class MulticastSocket extends EventEmitter {
      */
     public async send (
         message: Buffer,
-        options: SendOptions = {}
+        options: MulticastSocket.Send.Options = {}
     ): Promise<void> {
         return new Promise((resolve, reject) => {
             if (options.srcAddress) {
@@ -258,4 +255,37 @@ export default class MulticastSocket extends EventEmitter {
     }
 }
 
-export { MulticastSocket };
+export namespace MulticastSocket {
+    export type Options = Omit<SocketOptions, 'type'> & {
+        port: number;
+        /**
+         * The local IPv4, IPv6, or interface name to use with the socket
+         */
+        address?: string;
+        /**
+         * When exclusive is set to false (the default), cluster workers will use the same underlying
+         * socket handle allowing connection handling duties to be shared. When exclusive is true; however,
+         * the handle is not shared and attempted port sharing results in an error. Creating a Socket
+         * with the reusePort option set to true causes exclusive to always be true
+         */
+        exclusive?: boolean;
+        /**
+         * The multicast group to join
+         */
+        multicastAddress: string;
+        /**
+         * When set to true, outgoing multicast packets will also be received by the instance
+         */
+        loopback?: boolean;
+    }
+
+    export namespace Send {
+        export type Options = {
+            srcAddress?: string;
+            dstAddress?: string;
+            dstPort?: number;
+        }
+    }
+}
+
+export default MulticastSocket;
