@@ -20,33 +20,69 @@
 
 import { describe, it, before, after } from 'mocha';
 import MulticastSocket from '../src';
+import assert from 'assert';
 
 describe('Unit Tests', async () => {
     let socket: MulticastSocket;
     const message = Buffer.from('This is a test message');
 
-    before(() => {
-        socket = new MulticastSocket({
+    before(async () => {
+        socket = await MulticastSocket.create({
             port: 5959,
-            multicastAddress: '224.0.0.251',
+            multicastGroup: '224.0.0.251',
             loopback: true
         });
     });
 
-    after(() => {
+    after(async () => {
         if (socket) {
-            socket.close();
+            await socket.destroy();
         }
+    });
+
+    it('Has Addresses', () => {
+        assert.notEqual(socket.addresses.length, 0);
+    });
+
+    it('Has Interfaces', () => {
+        assert.notEqual(socket.interfaces.length, 0);
+    });
+
+    it('Has AddressInfo', () => {
+        assert.notEqual(socket.addressInfo.length, 0);
+    });
+
+    it('setTTL()', () => {
+        socket.setTTL(255);
+    });
+
+    it('setMulticastLoopback()', () => {
+        socket.setMulticastLoopback(true);
+    });
+
+    it('ref()', () => {
+        socket.ref();
+    });
+
+    it('unref()', () => {
+        socket.unref();
     });
 
     it('Sends & Receives message', async () => {
         return new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                return reject(new Error('Timeout waiting for multicast message'));
+            }, 1000);
+
             socket.once('message', (rmessage, rinfo, fromSelf) => {
+                clearTimeout(timeout);
                 if (rmessage.equals(message) && fromSelf) return resolve();
                 return reject(new Error('Message did not match'));
             });
 
-            socket.send(message).catch(error => reject(error));
+            socket.send(message).then(errors => {
+                if (errors.length > 0) return reject(errors);
+            });
         });
     });
 });

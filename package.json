@@ -1,6 +1,6 @@
 {
   "name": "@gibme/multicast",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "A simple multicast helper",
   "main": "./dist/index.js",
   "types": "./dist/index.ts",
@@ -40,8 +40,8 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "^22.15.17",
-    "@typescript-eslint/eslint-plugin": "^6.19.1",
-    "@typescript-eslint/parser": "^6.19.1",
+    "@typescript-eslint/eslint-plugin": "^8.34.0",
+    "@typescript-eslint/parser": "^8.34.0",
     "eslint": "^8.56.0",
     "eslint-config-standard": "^17.1.0",
     "eslint-plugin-import": "^2.29.1",
