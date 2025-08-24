@@ -1,6 +1,6 @@
 {
   "name": "@gibme/multicast",
-  "version": "2.0.0",
+  "version": "20.0.0",
   "description": "A simple multicast helper",
   "main": "./dist/index.js",
   "types": "./dist/index.ts",
@@ -30,7 +30,7 @@
   },
   "homepage": "https://gibme-npm.github.io/multicast/",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "engineStrict": true,
   "author": {
@@ -39,7 +39,7 @@
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
-    "@types/node": "^22.15.17",
+    "@types/node": "^24.3.0",
     "@typescript-eslint/eslint-plugin": "^8.34.0",
     "@typescript-eslint/parser": "^8.34.0",
     "eslint": "^8.56.0",
@@ -48,10 +48,10 @@
     "eslint-plugin-n": "^16.6.2",
     "eslint-plugin-node": "^11.1.0",
     "eslint-plugin-promise": "^6.1.1",
-    "mocha": "^11.0.1",
+    "mocha": "^11.7.1",
     "ts-node": "^10.9.2",
     "typedoc": "^0.28.4",
-    "typescript": "^5.8.3"
+    "typescript": "^5.9.2"
   },
   "dependencies": {
     "ip-address": "^10.0.1"
