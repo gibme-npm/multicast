@@ -1,11 +1,23 @@
 {
   "name": "@gibme/multicast",
-  "version": "20.0.0",
+  "version": "20.0.1",
   "description": "A simple multicast helper",
   "main": "./dist/index.js",
   "types": "./dist/index.ts",
   "files": [
     "dist/*"
+  ],
+  "keywords": [
+    "multicast",
+    "udp",
+    "unicast",
+    "socket",
+    "networking",
+    "ipv4",
+    "ipv6",
+    "broadcast",
+    "loopback",
+    "typescript"
   ],
   "license": "MIT",
   "scripts": {
