@@ -27,14 +27,15 @@ export { Address4, Address6 };
 
 export class MulticastSocket extends EventEmitter {
     /**
-     * Creates a new instance of a MulticastSocket
+     * Creates a new instance of a MulticastSocket. Use {@link MulticastSocket.create} instead
+     * of calling this constructor directly.
      *
-     * @param options
-     * @param type
-     * @param interfaces
-     * @param addresses
-     * @param multicastSocket
-     * @param unicastSockets
+     * @param options - the options used to create this socket
+     * @param type - the detected UDP socket type (`'udp4'` or `'udp6'`)
+     * @param interfaces - the resolved network interfaces as parsed IP address objects
+     * @param addresses - the resolved interface addresses as plain strings (without CIDR prefix)
+     * @param multicastSocket - the underlying dgram socket bound to `0.0.0.0` or `::` for group traffic
+     * @param unicastSockets - a map of interface address to its dedicated dgram unicast socket
      * @protected
      */
     protected constructor (
@@ -79,22 +80,24 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Creates a new multicast socket using the supplied options.
+     * Async factory that creates, binds, and returns a new {@link MulticastSocket}.
      *
-     * When creating an instance, the underlying socket(s) are created, the events are mapped
-     * through to the instance of this class, the sockets are bound, and we're off to the races.
+     * Internally this creates one multicast dgram socket bound to `0.0.0.0` (or `::` for IPv6)
+     * for group traffic, plus one unicast dgram socket per network interface for reliable
+     * multi-interface sending and receiving.
      *
-     * Note: the socket type (udp4 or udp6) is automatically detected based upon
-     * the type of `multicastGroup` supplied in the constructor options.
+     * The socket type (`udp4` or `udp6`) is automatically detected from the
+     * `multicastGroup` address provided in `options`.
      *
-     * Additionally, the `interface` supplied can be one of IPv4, IPv6, interface names, or undefined.
+     * The `host` option controls which interfaces are used:
+     * - If omitted, all available interfaces are used (similar to binding to `0.0.0.0` / `::`)
+     * - If an IP address string, only that interface is used
+     * - If a network interface name, all addresses assigned to that interface are used
      *
-     * If `interface` is undefined, we will listen on all available interfaces
-     *      (similar to binding to `0.0.0.0` or `::`)
-     *
-     * If `interface` is an interface name, we will listen to all addresses assigned to that interface
-     *
-     * @param options
+     * @param options - the configuration for the new socket
+     * @returns a fully initialized {@link MulticastSocket} ready to send and receive
+     * @throws Error if no usable interfaces are found, or if the specified host address
+     *         does not exist on this system or does not match the multicast group address family
      */
     public static async create (options: MulticastSocket.Options): Promise<MulticastSocket> {
         options.reuseAddr ??= true;
@@ -239,6 +242,21 @@ export class MulticastSocket extends EventEmitter {
             unicastSockets);
     }
 
+    /**
+     * Registers a listener for the given event.
+     *
+     * Events:
+     * - `'message'` — emitted when a UDP message is received. The listener receives the raw
+     *   message buffer, the local {@link AddressInfo} of the receiving socket, the
+     *   {@link RemoteInfo} of the sender, and a `fromSelf` boolean indicating whether the
+     *   message originated from this instance.
+     * - `'close'` — emitted when an underlying socket is closed.
+     * - `'connect'` — emitted when an underlying socket connects.
+     * - `'error'` — emitted when an underlying socket encounters an error.
+     *
+     * @param event - the event name
+     * @param listener - the callback to invoke when the event is emitted
+     */
     public on(event: 'close', listener: (local: AddressInfo) => void): this;
     public on(event: 'connect', listener: (local: AddressInfo) => void): this;
     public on(event: 'error', listener: (error: Error, local?: AddressInfo) => void): this;
@@ -253,6 +271,13 @@ export class MulticastSocket extends EventEmitter {
         return super.on(event, listener);
     }
 
+    /**
+     * Registers a one-time listener for the given event. The listener is automatically
+     * removed after it fires once.
+     *
+     * @param event - the event name
+     * @param listener - the callback to invoke when the event is emitted
+     */
     public once(event: 'close', listener: (local: AddressInfo) => void): this;
     public once(event: 'connect', listener: (local: AddressInfo) => void): this;
     public once(event: 'error', listener: (error: Error, local?: AddressInfo) => void): this;
@@ -267,6 +292,12 @@ export class MulticastSocket extends EventEmitter {
         return super.once(event, listener);
     }
 
+    /**
+     * Removes a previously registered listener for the given event.
+     *
+     * @param event - the event name
+     * @param listener - the callback to remove
+     */
     public off(event: 'close', listener: (local: AddressInfo) => void): this;
     public off(event: 'connect', listener: (local: AddressInfo) => void): this;
     public off(event: 'error', listener: (error: Error, local?: AddressInfo) => void): this;
@@ -282,28 +313,28 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Sends the specified message via the socket
+     * Sends a message to the multicast group (or a unicast destination).
      *
-     * By default, the packet will be sent out to the multicast group address from all
-     * the underlying unicast sockets.
+     * Socket selection:
+     * - By default, the message is sent from **all** underlying unicast sockets, ensuring
+     *   it goes out on every bound interface.
+     * - If `options.srcAddress` is set, only the unicast socket for that address is used.
+     * - If `options.useMulticastSocket` is set, the shared multicast socket is used instead.
+     *   When combined with `options.srcAddress`, the multicast interface is set accordingly;
+     *   without it, the OS chooses the outgoing interface, which may not cover all interfaces.
      *
-     * If `options.useMulticastSocket` is set, the packet will only be sent out via
-     * the underlying multicast socket; however, the behavior for this is undefined if
-     * the `options.srcAddress` is not also set as it may not be broadcasted on all
-     * interfaces as you might expect if the instance is also bound to `0.0.0.0` or `::`.
+     * Destination:
+     * - Defaults to the multicast group address and port from the constructor options.
+     * - Override with `options.dstAddress` and/or `options.dstPort` to send via unicast
+     *   or to a different port.
      *
-     * If `options.srcAddress` is set, the packet will only be sent out via the corresponding
-     * unicast socket.
+     * Partial failures are collected rather than thrown. Use {@link Promise.allSettled} semantics
+     * internally so that a failure on one interface does not prevent sending on others.
      *
-     * If `options.dstAddress` is set, the packet will be sent via unicast to the specified
-     * address.
-     *
-     * If any failures are returned upon attempting to send, they will be returned as an array
-     * of those errors.
-     *
-     * @param message
-     * @param options
-     * @throws Error if the specified `options.srcAddress` is not available
+     * @param message - the payload to send
+     * @param options - optional send configuration
+     * @returns an array of errors for any interfaces that failed to send (empty on full success)
+     * @throws Error if `options.srcAddress` is specified but no matching socket exists
      */
     public async send (
         message: string | NodeJS.ArrayBufferView | readonly any[],
@@ -372,9 +403,10 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Returns an array of objects containing the address information all the underlying sockets.
+     * Returns the address information for all underlying sockets (the multicast socket
+     * plus each per-interface unicast socket).
      *
-     * For UDP sockets, each object will contain address, family, and port properties.
+     * Each entry contains `address`, `family`, and `port` properties.
      */
     public get addressInfo (): AddressInfo[] {
         const result: AddressInfo[] = [this.multicastSocket.address()];
@@ -387,8 +419,9 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Sets the TTL of the socket
-     * @param ttl
+     * Sets both the unicast TTL and the multicast TTL on the underlying multicast socket.
+     *
+     * @param ttl - the time-to-live value (1-255)
      */
     public setTTL (ttl: number): void {
         this.multicastSocket.setTTL(ttl);
@@ -396,9 +429,11 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Sets or clears the IP_MULTICAST_LOOP socket option. When set to true, our own multicast packets will also
-     * be received on the local interface.
-     * @param loopback
+     * Sets or clears the `IP_MULTICAST_LOOP` socket option. When set to `true`, multicast
+     * packets sent by this instance will also be delivered to its own `'message'` event
+     * listeners (with `fromSelf` set to `true`).
+     *
+     * @param loopback - whether to enable multicast loopback
      */
     public setMulticastLoopback (loopback: boolean): void {
         this.options.loopback = loopback;
@@ -407,8 +442,10 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Close the underlying socket and stop listening for data on it. If a callback is provided, it
-     * is added as a listener for the 'close' event.
+     * Closes all underlying sockets and stops listening for data. Drops multicast group
+     * membership on each interface before closing the multicast socket.
+     *
+     * Prefer {@link destroy} for full cleanup, which also removes all event listeners.
      */
     public async close (): Promise<void> {
         const close = async (socket: Socket): Promise<void> =>
@@ -434,7 +471,9 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Closes the underlying socket(s) and cleans all event listeners from the instance
+     * Closes all underlying sockets and removes all event listeners from both the
+     * internal dgram sockets and this {@link MulticastSocket} instance. This is the
+     * recommended way to fully tear down a socket.
      */
     public async destroy (): Promise<void> {
         try {
@@ -445,14 +484,16 @@ export class MulticastSocket extends EventEmitter {
             }
 
             this.multicastSocket.removeAllListeners();
+
+            this.removeAllListeners();
         }
     }
 
     /**
-     * By default, binding a socket will cause it to block the Node.js process from exiting as long
-     * as the socket is open. The socket. unref() method can be used to exclude the socket from the
-     * reference counting that keeps the Node.js process active. The socket ref() method adds the
-     * socket back to the reference counting and restores the default behavior.
+     * Adds all underlying sockets back to the Node.js event loop reference count, restoring
+     * the default behavior where the process will not exit while the sockets are open.
+     *
+     * Call this to undo a previous {@link unref} call.
      */
     public ref (): void {
         for (const [, socket] of this.unicastSockets) {
@@ -463,10 +504,10 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * By default, binding a socket will cause it to block the Node.js process from exiting as long
-     * as the socket is open. The socket unref() method can be used to exclude the socket from the
-     * reference counting that keeps the Node.js process active, allowing the process to exit even
-     * if the socket is still listening
+     * Excludes all underlying sockets from the Node.js event loop reference count, allowing
+     * the process to exit even if the sockets are still open.
+     *
+     * Call {@link ref} to restore the default behavior.
      */
     public unref (): void {
         for (const [, socket] of this.unicastSockets) {
@@ -484,31 +525,28 @@ export namespace MulticastSocket {
          */
         port: number;
         /**
-         * The local IPv4, IPv6, or interface name to which the multicast socket is bound.
-         * If unspecified, the socket will listen to all available interfaces.
+         * The local host to bind to. Accepts an IPv4 address, IPv6 address, or a network
+         * interface name (e.g. `'eth0'`). If omitted, all available interfaces are used.
          *
-         * Note: if the interface is an IPv4 or IPv6 address, the socket will only listen on
-         * that interface. If the interface is an interface name, the socket will listen to
-         * all addresses assigned to that interface.
-         *
-         * Note: if the interface is an IPv6 address, the socket will only listen on that
-         * interface. If the interface is an interface name, the socket will listen to
-         * all addresses assigned to that interface.
+         * When an IP address is provided, only the matching interface is used. When an
+         * interface name is provided, all addresses assigned to that interface are used.
+         * The address family must match the `multicastGroup` (IPv4 group requires IPv4 host).
          */
         host?: string | Address4 | Address6;
         /**
-         * When exclusive is set to false (the default), cluster workers will use the same underlying
-         * socket handle allowing connection handling duties to be shared. When exclusive is true; however,
-         * the handle is not shared and attempted port sharing results in an error. Creating a Socket
-         * with the reusePort option set to true causes exclusive to always be true
+         * When `false` (the default), cluster workers share the same underlying socket handle.
+         * When `true`, the handle is not shared and attempted port sharing results in an error.
+         *
+         * Note: setting `reusePort` to `true` implicitly forces `exclusive` to `true`.
          */
         exclusive?: boolean;
         /**
-         * The multicast group address to join
+         * The multicast group address to join (e.g. `'224.0.0.251'` for IPv4).
          */
         multicastGroup: string;
         /**
-         * When set to true, the instance will also receive outgoing multicast packets
+         * When `true`, the instance will also receive its own outgoing multicast packets
+         * via the `'message'` event (with `fromSelf` set to `true`).
          * @default false
          */
         loopback?: boolean;
@@ -517,29 +555,30 @@ export namespace MulticastSocket {
     export namespace Send {
         export type Options = {
             /**
-             * If set, will send the packet via the multicast socket.
+             * If `true`, sends the packet via the shared multicast socket instead of the
+             * per-interface unicast sockets. Combine with `srcAddress` to control which
+             * interface the multicast socket uses; without it, the OS chooses the interface.
              * @default false
              */
             useMulticastSocket?: boolean;
             /**
-             * The source address to use for the outgoing multicast packet.
+             * The source address to use for the outgoing packet.
              *
-             * Note: if not specified, the packet is sent out of all the underlying
-             * unicast sockets so long as `sendViaMulticast` is not specified.
+             * If not specified (and `useMulticastSocket` is not set), the packet is sent
+             * from all underlying unicast sockets.
              */
             srcAddress?: string | Address4 | Address6;
             /**
-             * The unicast destination address to use for the outgoing packet.
+             * The destination address for the outgoing packet.
              *
-             * Note: if not specified, the packet is sent to the multicast address
-             * specified in the constructor options.
+             * Defaults to the `multicastGroup` address from the constructor options.
+             * Set this to send a unicast message to a specific host instead.
              */
             dstAddress?: string | Address4 | Address6;
             /**
-             * The destination port to use for the outgoing multicast packet.
+             * The destination port for the outgoing packet.
              *
-             * Note: if not specified, the packet is sent to the port specified in the
-             * constructor options.
+             * Defaults to the `port` from the constructor options.
              */
             dstPort?: number;
         }

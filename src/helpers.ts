@@ -23,9 +23,11 @@ import { Address4, Address6 } from 'ip-address';
 import { networkInterfaces } from 'os';
 
 /**
- * Detects the socket type based upon the ip address supplied
+ * Detects the UDP socket type based on the IP address supplied.
  *
- * @param address
+ * @param address - an IPv4/IPv6 address as a string, {@link Address4}, or {@link Address6}
+ * @returns `'udp4'` for IPv4 addresses, `'udp6'` for IPv6 addresses
+ * @throws Error if the address string is not a valid IPv4 or IPv6 address
  */
 export const detect_type = (address: Address4 | Address6 | string): SocketType => {
     if (typeof address === 'string') {
@@ -43,11 +45,12 @@ export const detect_type = (address: Address4 | Address6 | string): SocketType =
 };
 
 /**
- * Compare helper for ip addresses so that they are sorted by their actual value
- * instead of the string representation
+ * Comparator for sorting IP addresses by their numeric value rather than
+ * their string representation.
  *
- * @param a
- * @param b
+ * @param a - the first address to compare
+ * @param b - the second address to compare
+ * @returns `-1` if `a < b`, `0` if equal, `1` if `a > b`
  */
 export const compare_IP_addresses = (
     a: Address4 | Address6,
@@ -59,8 +62,10 @@ export const compare_IP_addresses = (
 };
 
 /**
- * Converts a netmask (255.255.255.255) to the prefix for CIDR notation
- * @param mask
+ * Converts a dotted-decimal netmask (e.g. `'255.255.255.0'`) to its CIDR prefix length.
+ *
+ * @param mask - the netmask in dotted-decimal notation
+ * @returns the number of leading `1` bits (e.g. `24` for `'255.255.255.0'`)
  */
 const netmask_to_prefix = (mask: string): number =>
     mask.split('.')
@@ -71,10 +76,14 @@ const netmask_to_prefix = (mask: string): number =>
         .length;
 
 /**
- * Gets all the addresses on the system for the specified type of socket
+ * Returns all non-internal network addresses on the system that match the
+ * specified socket type, optionally filtered to a single network interface.
  *
- * @param type
- * @param name
+ * Each returned address includes its CIDR prefix (e.g. `192.168.1.5/24`).
+ *
+ * @param type - `'udp4'` for IPv4 addresses, `'udp6'` for IPv6 addresses
+ * @param name - if provided, only addresses from the named interface are returned
+ * @returns an array of {@link Address4} or {@link Address6} instances
  */
 export const get_addresses = (
     type: SocketType,
@@ -111,9 +120,11 @@ export const get_addresses = (
 };
 
 /**
- * Checks to determine if the address specified is a valid IPv4 or IPv6 address
+ * Parses the given string as an IPv4 or IPv6 address.
  *
- * @param address
+ * @param address - the address string to validate
+ * @returns an {@link Address4} or {@link Address6} instance if valid, or `undefined` if
+ *          the string is not a valid IP address
  */
 export const is_valid_ip = (address: string): Address4 | Address6 | undefined => {
     if (Address4.isValid(address)) return new Address4(address);
