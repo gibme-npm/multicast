@@ -22,7 +22,7 @@ import { createSocket, RemoteInfo, Socket, SocketOptions, SocketType } from 'dgr
 import { AddressInfo } from 'net';
 import { EventEmitter } from 'events';
 import { Address4, Address6 } from 'ip-address';
-import { compare_IP_addresses, detect_type, get_addresses, is_valid_ip } from './helpers';
+import { compare_IP_addresses, detect_type, get_addresses, is_on_local_link, is_valid_ip } from './helpers';
 export { Address4, Address6 };
 
 export class MulticastSocket extends EventEmitter {
@@ -55,11 +55,7 @@ export class MulticastSocket extends EventEmitter {
             .on('connect', () => this.emit('connect', multicastSocketAddress))
             .on('error', error => this.emit('error', error, multicastSocketAddress))
             .on('message', (message: Buffer, rinfo: RemoteInfo) => {
-                const self = this.addresses.includes(rinfo.address);
-
-                if (!this.options.loopback && self) return;
-
-                this.emit('message', message, multicastSocketAddress, rinfo, self);
+                this.dispatch_message(message, multicastSocketAddress, rinfo);
             });
 
         this.unicastSockets.forEach(socket => {
@@ -70,13 +66,27 @@ export class MulticastSocket extends EventEmitter {
                 .on('connect', () => this.emit('connect', address))
                 .on('error', error => this.emit('error', error, address))
                 .on('message', (message: Buffer, rinfo: RemoteInfo) => {
-                    const self = this.addresses.includes(rinfo.address);
-
-                    if (!this.options.loopback && self) return;
-
-                    this.emit('message', message, address, rinfo, self);
+                    this.dispatch_message(message, address, rinfo);
                 });
         });
+    }
+
+    /**
+     * Applies the inbound filters (`fromSelf` short-circuit and RFC 6762 §11
+     * link-local origin check) and emits the appropriate event.
+     */
+    private dispatch_message (message: Buffer, local: AddressInfo, rinfo: RemoteInfo): void {
+        const self = this.addresses.includes(rinfo.address);
+
+        if (!this.options.loopback && self) return;
+
+        if (this.options.linkLocalOnly && !is_on_local_link(rinfo.address, this.type)) {
+            this.emit('drop', message, local, rinfo, 'off-link');
+
+            return;
+        }
+
+        this.emit('message', message, local, rinfo, self);
     }
 
     /**
@@ -101,6 +111,7 @@ export class MulticastSocket extends EventEmitter {
      */
     public static async create (options: MulticastSocket.Options): Promise<MulticastSocket> {
         options.reuseAddr ??= true;
+        options.linkLocalOnly ??= true;
 
         const type = detect_type(options.multicastGroup);
 
@@ -199,6 +210,13 @@ export class MulticastSocket extends EventEmitter {
                 socket.bind({ address, exclusive: options.exclusive ?? false }, () => {
                     socket.off('error', handle_error);
 
+                    // RFC 6762 §11: outbound multicast must carry IP TTL/Hop Limit 255.
+                    // Default send() uses the per-interface unicast sockets, so they
+                    // need IP_MULTICAST_TTL set explicitly, otherwise the kernel default
+                    // (typically 1) leaks out and breaks off-link receive verification.
+                    socket.setTTL(255);
+                    socket.setMulticastTTL(255);
+
                     return resolve(socket);
                 });
             });
@@ -246,13 +264,18 @@ export class MulticastSocket extends EventEmitter {
      * Registers a listener for the given event.
      *
      * Events:
-     * - `'message'` — emitted when a UDP message is received. The listener receives the raw
-     *   message buffer, the local {@link AddressInfo} of the receiving socket, the
-     *   {@link RemoteInfo} of the sender, and a `fromSelf` boolean indicating whether the
-     *   message originated from this instance.
-     * - `'close'` — emitted when an underlying socket is closed.
-     * - `'connect'` — emitted when an underlying socket connects.
-     * - `'error'` — emitted when an underlying socket encounters an error.
+     * - `'message'`: emitted when a UDP message is received and passes all inbound
+     *   filters. The listener receives the raw message buffer, the local
+     *   {@link AddressInfo} of the receiving socket, the {@link RemoteInfo} of the
+     *   sender, and a `fromSelf` boolean indicating whether the message originated
+     *   from this instance.
+     * - `'drop'`: emitted when an inbound message is rejected by a filter. Currently
+     *   the only reason is `'off-link'` (RFC 6762 §11 link-local origin check failed
+     *   while `options.linkLocalOnly` was true). The listener receives the message,
+     *   the local address, the remote address, and the reason string.
+     * - `'close'`: emitted when an underlying socket is closed.
+     * - `'connect'`: emitted when an underlying socket connects.
+     * - `'error'`: emitted when an underlying socket encounters an error.
      *
      * @param event - the event name
      * @param listener - the callback to invoke when the event is emitted
@@ -265,6 +288,13 @@ export class MulticastSocket extends EventEmitter {
         local: AddressInfo,
         remote: RemoteInfo,
         fromSelf: boolean
+    ) => void): this;
+
+    public on(event: 'drop', listener: (
+        message: Buffer,
+        local: AddressInfo,
+        remote: RemoteInfo,
+        reason: MulticastSocket.DropReason
     ) => void): this;
 
     public on (event: any, listener: (...args: any[]) => void): this {
@@ -288,6 +318,13 @@ export class MulticastSocket extends EventEmitter {
         fromSelf: boolean
     ) => void): this;
 
+    public once(event: 'drop', listener: (
+        message: Buffer,
+        local: AddressInfo,
+        remote: RemoteInfo,
+        reason: MulticastSocket.DropReason
+    ) => void): this;
+
     public once (event: any, listener: (...args: any[]) => void): this {
         return super.once(event, listener);
     }
@@ -306,6 +343,13 @@ export class MulticastSocket extends EventEmitter {
         local: AddressInfo,
         remote: RemoteInfo,
         fromSelf: boolean
+    ) => void): this;
+
+    public off(event: 'drop', listener: (
+        message: Buffer,
+        local: AddressInfo,
+        remote: RemoteInfo,
+        reason: MulticastSocket.DropReason
     ) => void): this;
 
     public off (event: any, listener: (...args: any[]) => void): this {
@@ -419,13 +463,23 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Sets both the unicast TTL and the multicast TTL on the underlying multicast socket.
+     * Sets both the unicast TTL and the multicast TTL on every underlying socket
+     * (the shared multicast socket and each per-interface unicast socket).
+     *
+     * Propagating to the unicast sockets is required for RFC 6762 §11 outbound:
+     * `send()` uses them by default, so a value set only on the multicast socket
+     * would not affect default-path traffic.
      *
      * @param ttl - the time-to-live value (1-255)
      */
     public setTTL (ttl: number): void {
         this.multicastSocket.setTTL(ttl);
         this.multicastSocket.setMulticastTTL(ttl);
+
+        for (const [, socket] of this.unicastSockets) {
+            socket.setTTL(ttl);
+            socket.setMulticastTTL(ttl);
+        }
     }
 
     /**
@@ -550,7 +604,31 @@ export namespace MulticastSocket {
          * @default false
          */
         loopback?: boolean;
+        /**
+         * RFC 6762 §11 inbound origin verification (no-native-deps approximation).
+         *
+         * When `true` (the default), received messages whose source address is not on a
+         * local-link subnet of any interface this host owns (plus loopback) are dropped
+         * before the `'message'` event fires. Dropped packets are surfaced via the
+         * `'drop'` event with reason `'off-link'`.
+         *
+         * Set to `false` for receive scenarios that legitimately cross routed segments
+         * (e.g. SSDP over Layer 3, multicast across VPN tunnels).
+         *
+         * True §11 wants `IP_TTL === 255` on inbound, which Node's `dgram.Socket` does
+         * not expose; the subnet check is the interim until a native-addon receive path
+         * is available.
+         * @default true
+         */
+        linkLocalOnly?: boolean;
     }
+
+    /**
+     * Reason a packet was dropped before the `'message'` event would have fired.
+     *
+     * - `'off-link'`: source address failed the `linkLocalOnly` check (RFC 6762 §11).
+     */
+    export type DropReason = 'off-link';
 
     export namespace Send {
         export type Options = {

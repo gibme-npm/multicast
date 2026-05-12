@@ -130,3 +130,66 @@ export const is_valid_ip = (address: string): Address4 | Address6 | undefined =>
     if (Address4.isValid(address)) return new Address4(address);
     if (Address6.isValid(address)) return new Address6(address);
 };
+
+const IPV4_LOOPBACK_SUBNET = new Address4('127.0.0.0/8');
+const IPV6_LINK_LOCAL_SUBNET = new Address6('fe80::/10');
+
+/**
+ * Returns `true` if `remote` is on a local-link subnet of any non-internal interface
+ * this host owns, or is a loopback address.
+ *
+ * This is the no-native-deps approximation of RFC 6762 §11 inbound origin verification.
+ * True §11 wants `IP_TTL === 255` on inbound, which Node's `dgram.Socket` does not
+ * expose. Until a native `recvmsg` + `IP_RECVTTL` / `IPV6_RECVHOPLIMIT` path lands, a
+ * source-address subnet check rejects off-link injection in the common case.
+ *
+ * For `udp4`: accepts any address in `127.0.0.0/8`, plus any address that falls within
+ * the CIDR subnet of a non-internal IPv4 interface from `os.networkInterfaces()`.
+ *
+ * For `udp6`: accepts `::1`, any `fe80::/10` link-local address, plus any address that
+ * falls within the CIDR subnet of a non-internal IPv6 interface. An IPv6 zone-id
+ * suffix (e.g. `%eth0`) on the input is stripped before parsing.
+ *
+ * `os.networkInterfaces()` is re-read on every call via {@link get_addresses}, so the
+ * result reflects the current state of the system (no stale-cache window after a VPN
+ * connect or NIC up/down event).
+ *
+ * @param remote - the source address from a received UDP datagram (e.g. `RemoteInfo.address`)
+ * @param type - `'udp4'` if the receiving socket is IPv4, `'udp6'` if IPv6
+ * @returns `true` if the source is on a local link of this host, `false` otherwise
+ */
+export const is_on_local_link = (remote: string, type: SocketType): boolean => {
+    if (!remote) return false;
+
+    const addrStr = remote.split('%')[0];
+
+    if (type === 'udp4') {
+        if (!Address4.isValid(addrStr)) return false;
+
+        const addr = new Address4(addrStr);
+
+        if (addr.isInSubnet(IPV4_LOOPBACK_SUBNET)) return true;
+
+        for (const iface of get_addresses('udp4')) {
+            if (addr.isInSubnet(iface as Address4)) return true;
+        }
+
+        return false;
+    }
+
+    if (!Address6.isValid(addrStr)) return false;
+
+    const addr = new Address6(addrStr);
+
+    if (addr.isLoopback()) return true;
+    // Wider than Address6.isLinkLocal(): that method requires bits 10-63 to be zero
+    // (effectively fe80::/64). RFC 4291 reserves the entire fe80::/10 block for
+    // link-local unicast, so accept the full prefix range here.
+    if (addr.isInSubnet(IPV6_LINK_LOCAL_SUBNET)) return true;
+
+    for (const iface of get_addresses('udp6')) {
+        if (addr.isInSubnet(iface as Address6)) return true;
+    }
+
+    return false;
+};

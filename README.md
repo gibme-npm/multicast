@@ -69,6 +69,15 @@ When you call `send()`, the message goes out on **every** unicast socket (unless
 
 The socket type (`udp4` / `udp6`) is detected automatically from the `multicastGroup` address.
 
+### RFC 6762 §11 (off-link defense)
+
+Out of the box, this library applies both halves of RFC 6762 §11 to defend against off-link injection of multicast traffic (the threat motivates protocols like mDNS):
+
+* Outbound: every underlying socket (the shared multicast socket and each per-interface unicast socket) is configured with `IP_MULTICAST_TTL = 255` at bind time, so all multicast sends leave at TTL 255 regardless of which send path `send()` picks.
+* Inbound: received packets whose source address is not on a local-link subnet of any interface this host owns are dropped before the `'message'` event fires. Dropped packets surface as the `'drop'` event with reason `'off-link'`. Disable with `linkLocalOnly: false` if you need to receive multicast across routed segments.
+
+The inbound check is a source-address subnet approximation: true §11 wants `IP_TTL === 255` on inbound, but Node's `dgram.Socket` does not expose the received TTL (no `IP_RECVTTL` / `IPV6_RECVHOPLIMIT` ancillary data). The subnet filter is the no-native-deps interim; a future native-addon `recvmsg` receive path could enforce TTL = 255 literally.
+
 ## API
 
 ### `MulticastSocket.create(options): Promise<MulticastSocket>`
@@ -86,6 +95,7 @@ Async factory that creates, binds, and returns a new socket.
 | `reuseAddr` | `boolean` | `true` | Enables `SO_REUSEADDR` on the socket. |
 | `reusePort` | `boolean` | `false` | Enables `SO_REUSEPORT` on the socket (implicitly sets `exclusive` to `true`). |
 | `exclusive` | `boolean` | `false` | When `true`, the socket handle is not shared with cluster workers. |
+| `linkLocalOnly` | `boolean` | `true` | RFC 6762 §11 inbound origin verification. Drops received messages whose source address is not on a local-link subnet of any local interface (loopback is allowed). Dropped packets surface as the `'drop'` event. Set to `false` for receive scenarios that legitimately cross routed segments (e.g. SSDP over Layer 3). |
 
 ### `socket.send(message, options?): Promise<Error[]>`
 
@@ -139,7 +149,8 @@ All events pass the `local: AddressInfo` of the socket that triggered them.
 
 | Event | Arguments | Description |
 |---|---|---|
-| `message` | `(message: Buffer, local: AddressInfo, remote: RemoteInfo, fromSelf: boolean)` | A UDP message was received. `fromSelf` indicates whether the message originated from this instance. |
+| `message` | `(message: Buffer, local: AddressInfo, remote: RemoteInfo, fromSelf: boolean)` | A UDP message was received and passed all inbound filters. `fromSelf` indicates whether the message originated from this instance. |
+| `drop` | `(message: Buffer, local: AddressInfo, remote: RemoteInfo, reason: 'off-link')` | A received UDP message was rejected by an inbound filter. Currently the only reason is `'off-link'` (failed the `linkLocalOnly` check). Useful for logging or alerting on suspect traffic. |
 | `close` | `(local: AddressInfo)` | An underlying socket was closed. |
 | `connect` | `(local: AddressInfo)` | An underlying socket connected. |
 | `error` | `(error: Error, local?: AddressInfo)` | An underlying socket encountered an error. |
@@ -169,6 +180,7 @@ import {
 | `get_addresses(type, name?)` | Returns all non-internal network addresses on the system matching the socket type, with CIDR prefixes. Optionally filter by interface name. |
 | `is_valid_ip(address)` | Returns an `Address4` or `Address6` if valid, `undefined` otherwise. |
 | `compare_IP_addresses(a, b)` | Numeric comparator for sorting IP addresses (usable with `Array.sort()`). |
+| `is_on_local_link(remote, type)` | Returns `true` if `remote` is on a local-link subnet of an interface this host owns (or is a loopback / IPv6 link-local address). Used internally by the `linkLocalOnly` filter; exported so downstream packages can apply the same check on their own dgram paths. |
 
 ## Examples
 

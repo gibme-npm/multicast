@@ -20,7 +20,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import MulticastSocket, { Address4, Address6 } from '../src';
-import { compare_IP_addresses, detect_type, get_addresses, is_valid_ip } from '../src/helpers';
+import { compare_IP_addresses, detect_type, get_addresses, is_on_local_link, is_valid_ip } from '../src/helpers';
 import assert from 'assert';
 
 describe('Helper Functions', () => {
@@ -193,6 +193,76 @@ describe('Helper Functions', () => {
             for (const addr of result) {
                 const ip = addr.address.split('/')[0];
                 assert.notStrictEqual(ip, '127.0.0.1');
+            }
+        });
+    });
+
+    describe('is_on_local_link()', () => {
+        it('returns true for 127.0.0.1 (udp4)', () => {
+            assert.strictEqual(is_on_local_link('127.0.0.1', 'udp4'), true);
+        });
+
+        it('returns true for arbitrary 127.0.0.0/8 (udp4)', () => {
+            assert.strictEqual(is_on_local_link('127.0.0.5', 'udp4'), true);
+            assert.strictEqual(is_on_local_link('127.255.255.254', 'udp4'), true);
+        });
+
+        it('returns true for ::1 (udp6)', () => {
+            assert.strictEqual(is_on_local_link('::1', 'udp6'), true);
+        });
+
+        it('returns true for link-local fe80::/10 (udp6)', () => {
+            assert.strictEqual(is_on_local_link('fe80::1', 'udp6'), true);
+            assert.strictEqual(is_on_local_link('febf::ffff', 'udp6'), true);
+        });
+
+        it('strips an IPv6 zone-id before evaluating (udp6)', () => {
+            assert.strictEqual(is_on_local_link('fe80::1%eth0', 'udp6'), true);
+            assert.strictEqual(is_on_local_link('::1%lo', 'udp6'), true);
+        });
+
+        it('returns false for a routable IPv4 (udp4)', () => {
+            assert.strictEqual(is_on_local_link('8.8.8.8', 'udp4'), false);
+            // RFC 5737 TEST-NET-3, guaranteed not in any iface subnet
+            assert.strictEqual(is_on_local_link('203.0.113.1', 'udp4'), false);
+        });
+
+        it('returns false for a routable IPv6 GUA (udp6)', () => {
+            assert.strictEqual(is_on_local_link('2001:4860:4860::8888', 'udp6'), false);
+        });
+
+        it('returns false for empty input', () => {
+            assert.strictEqual(is_on_local_link('', 'udp4'), false);
+            assert.strictEqual(is_on_local_link('', 'udp6'), false);
+        });
+
+        it('returns false for an IPv6 string passed with udp4', () => {
+            assert.strictEqual(is_on_local_link('fe80::1', 'udp4'), false);
+        });
+
+        it('returns false for an IPv4 string passed with udp6', () => {
+            assert.strictEqual(is_on_local_link('192.168.1.1', 'udp6'), false);
+        });
+
+        it('returns true for every udp4 interface address on this host', () => {
+            for (const iface of get_addresses('udp4')) {
+                const addrStr = iface.address.split('/')[0];
+                assert.strictEqual(
+                    is_on_local_link(addrStr, 'udp4'),
+                    true,
+                    `Expected ${addrStr} to be on-link`
+                );
+            }
+        });
+
+        it('returns true for every udp6 interface address on this host', () => {
+            for (const iface of get_addresses('udp6')) {
+                const addrStr = iface.address.split('/')[0];
+                assert.strictEqual(
+                    is_on_local_link(addrStr, 'udp6'),
+                    true,
+                    `Expected ${addrStr} to be on-link`
+                );
             }
         });
     });
@@ -371,6 +441,134 @@ describe('MulticastSocket', () => {
             assert.strictEqual(socket.options.port, 5962);
             assert.strictEqual(socket.options.multicastGroup, '224.0.0.251');
             assert.strictEqual(socket.options.loopback, true);
+        });
+    });
+
+    describe('linkLocalOnly option', () => {
+        it('defaults to true', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5980,
+                multicastGroup: '224.0.0.251'
+            });
+
+            try {
+                assert.strictEqual(socket.options.linkLocalOnly, true);
+            } finally {
+                await socket.destroy();
+            }
+        });
+
+        it('passes explicit false through', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5981,
+                multicastGroup: '224.0.0.251',
+                linkLocalOnly: false
+            });
+
+            try {
+                assert.strictEqual(socket.options.linkLocalOnly, false);
+            } finally {
+                await socket.destroy();
+            }
+        });
+
+        it('emits drop and suppresses message for off-link source when enabled', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5982,
+                multicastGroup: '224.0.0.251'
+            });
+
+            try {
+                let droppedReason: string | undefined;
+                let messageFired = false;
+
+                socket.on('drop', (_msg, _local, _remote, reason) => {
+                    droppedReason = reason;
+                });
+                socket.on('message', () => {
+                    messageFired = true;
+                });
+
+                // Synthesize an off-link receive on the underlying multicast socket.
+                // 203.0.113.1 is RFC 5737 TEST-NET-3, guaranteed not on any local link.
+                const underlying = (socket as any).multicastSocket;
+                underlying.emit('message', Buffer.from('off-link'), {
+                    address: '203.0.113.1',
+                    family: 'IPv4',
+                    port: 5959,
+                    size: 8
+                });
+
+                assert.strictEqual(droppedReason, 'off-link');
+                assert.strictEqual(messageFired, false);
+            } finally {
+                await socket.destroy();
+            }
+        });
+
+        it('passes off-link source through when disabled', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5983,
+                multicastGroup: '224.0.0.251',
+                linkLocalOnly: false
+            });
+
+            try {
+                let droppedReason: string | undefined;
+                let messageFired = false;
+
+                socket.on('drop', (_msg, _local, _remote, reason) => {
+                    droppedReason = reason;
+                });
+                socket.on('message', () => {
+                    messageFired = true;
+                });
+
+                const underlying = (socket as any).multicastSocket;
+                underlying.emit('message', Buffer.from('off-link'), {
+                    address: '203.0.113.1',
+                    family: 'IPv4',
+                    port: 5959,
+                    size: 8
+                });
+
+                assert.strictEqual(droppedReason, undefined);
+                assert.strictEqual(messageFired, true);
+            } finally {
+                await socket.destroy();
+            }
+        });
+
+        it('emits drop on the per-interface unicast socket path too', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5984,
+                multicastGroup: '224.0.0.251'
+            });
+
+            try {
+                if (socket.addresses.length === 0) {
+                    await socket.destroy();
+                    return;
+                }
+
+                let droppedReason: string | undefined;
+
+                socket.on('drop', (_msg, _local, _remote, reason) => {
+                    droppedReason = reason;
+                });
+
+                const unicast = (socket as any).unicastSockets.get(socket.addresses[0]);
+                unicast.emit('message', Buffer.from('off-link'), {
+                    address: '203.0.113.1',
+                    family: 'IPv4',
+                    port: 5959,
+                    size: 8
+                });
+
+                assert.strictEqual(droppedReason, 'off-link');
+            } finally {
+                await socket.destroy();
+            }
         });
     });
 
