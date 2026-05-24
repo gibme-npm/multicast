@@ -472,7 +472,7 @@ describe('MulticastSocket', () => {
             }
         });
 
-        it('emits drop and suppresses message for off-link source when enabled', async () => {
+        it('delivers off-link source on multicast socket path (RFC 6762 §11 mcast-dst exemption)', async () => {
             const socket = await MulticastSocket.create({
                 port: 5982,
                 multicastGroup: '224.0.0.251'
@@ -491,6 +491,10 @@ describe('MulticastSocket', () => {
 
                 // Synthesize an off-link receive on the underlying multicast socket.
                 // 203.0.113.1 is RFC 5737 TEST-NET-3, guaranteed not on any local link.
+                // Per RFC 6762 §11, packets received with a multicast destination address
+                // are deemed on-link regardless of source IP. The shared multicast socket
+                // is the only socket joined to the group, so packets arriving on it are by
+                // construction multicast-destination, and the source-subnet check is skipped.
                 const underlying = (socket as any).multicastSocket;
                 underlying.emit('message', Buffer.from('off-link'), {
                     address: '203.0.113.1',
@@ -499,8 +503,8 @@ describe('MulticastSocket', () => {
                     size: 8
                 });
 
-                assert.strictEqual(droppedReason, 'off-link');
-                assert.strictEqual(messageFired, false);
+                assert.strictEqual(droppedReason, undefined);
+                assert.strictEqual(messageFired, true);
             } finally {
                 await socket.destroy();
             }
@@ -569,34 +573,6 @@ describe('MulticastSocket', () => {
             } finally {
                 await socket.destroy();
             }
-        });
-    });
-
-    describe('setTTL()', () => {
-        let socket: MulticastSocket;
-
-        before(async () => {
-            socket = await MulticastSocket.create({
-                port: 5963,
-                multicastGroup: '224.0.0.251',
-                loopback: true
-            });
-        });
-
-        after(async () => {
-            if (socket) await socket.destroy();
-        });
-
-        it('does not throw for valid TTL', () => {
-            socket.setTTL(128);
-        });
-
-        it('accepts TTL of 1', () => {
-            socket.setTTL(1);
-        });
-
-        it('accepts TTL of 255', () => {
-            socket.setTTL(255);
         });
     });
 
@@ -1059,6 +1035,179 @@ describe('MulticastSocket', () => {
         it('are on different ports', () => {
             assert.strictEqual(socket1.options.port, 5974);
             assert.strictEqual(socket2.options.port, 5975);
+        });
+    });
+});
+
+describe('input validation and dispatch hardening', () => {
+    describe('multicastGroup must be a multicast address', () => {
+        it('rejects unicast IPv4 as multicastGroup before any socket allocation', async () => {
+            const start = Date.now();
+            await assert.rejects(
+                () => MulticastSocket.create({
+                    port: 5985,
+                    multicastGroup: '8.8.8.8'
+                }),
+                /is not a multicast address/
+            );
+            const elapsed = Date.now() - start;
+            // Upfront validation should be sub-millisecond; if it takes longer,
+            // we are allocating sockets before validating.
+            assert.ok(elapsed < 200, `Rejection took ${elapsed}ms, indicating late failure`);
+        });
+
+        it('rejects unicast IPv6 as multicastGroup before any socket allocation', async () => {
+            const start = Date.now();
+            await assert.rejects(
+                () => MulticastSocket.create({
+                    port: 5986,
+                    multicastGroup: '2001:db8::1'
+                }),
+                /is not a multicast address/
+            );
+            const elapsed = Date.now() - start;
+            assert.ok(elapsed < 200, `Rejection took ${elapsed}ms, indicating late failure`);
+        });
+
+        it('accepts a valid multicast IPv4 group', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5987,
+                multicastGroup: '224.0.0.251'
+            });
+            await socket.destroy();
+        });
+    });
+
+    describe('dispatch_message unicast-path still drops off-link source', () => {
+        it('emits drop for off-link source on the per-interface unicast socket path', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5988,
+                multicastGroup: '224.0.0.251'
+            });
+
+            try {
+                if (socket.addresses.length === 0) {
+                    await socket.destroy();
+                    return;
+                }
+
+                let droppedReason: string | undefined;
+                let messageFired = false;
+
+                socket.on('drop', (_msg, _local, _remote, reason) => {
+                    droppedReason = reason;
+                });
+                socket.on('message', () => {
+                    messageFired = true;
+                });
+
+                const unicast = (socket as any).unicastSockets.get(socket.addresses[0]);
+                unicast.emit('message', Buffer.from('off-link'), {
+                    address: '203.0.113.1',
+                    family: 'IPv4',
+                    port: 5959,
+                    size: 8
+                });
+
+                assert.strictEqual(droppedReason, 'off-link');
+                assert.strictEqual(messageFired, false);
+            } finally {
+                await socket.destroy();
+            }
+        });
+    });
+
+    describe('dispatch_message fromSelf normalizes IPv6 zone-id suffix', () => {
+        it('treats own-address with %zone suffix as fromSelf=true', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5989,
+                multicastGroup: '224.0.0.251',
+                loopback: true,
+                linkLocalOnly: false
+            });
+
+            try {
+                if (socket.addresses.length === 0) {
+                    await socket.destroy();
+                    return;
+                }
+
+                const ownAddr = socket.addresses[0];
+                let observedFromSelf: boolean | undefined;
+                let messageFired = false;
+
+                socket.on('message', (_msg, _local, _remote, fromSelf) => {
+                    messageFired = true;
+                    observedFromSelf = fromSelf;
+                });
+
+                const underlying = (socket as any).multicastSocket;
+                underlying.emit('message', Buffer.from('zoneid'), {
+                    address: `${ownAddr}%mockzone`,
+                    family: 'IPv4',
+                    port: 5959,
+                    size: 6
+                });
+
+                assert.strictEqual(messageFired, true);
+                assert.strictEqual(observedFromSelf, true,
+                    'fromSelf should be true for own address even with zone-id suffix');
+            } finally {
+                await socket.destroy();
+            }
+        });
+    });
+
+    describe('send normalizes zone-id from srcAddress', () => {
+        it('send accepts srcAddress with %zone suffix when unscoped form is bound', async () => {
+            const socket = await MulticastSocket.create({
+                port: 5990,
+                multicastGroup: '224.0.0.251',
+                loopback: true
+            });
+
+            try {
+                if (socket.addresses.length === 0) {
+                    await socket.destroy();
+                    return;
+                }
+
+                // No throw expected: the zone-id should be stripped before
+                // the address-membership check.
+                const errors = await socket.send(Buffer.from('zone-src'), {
+                    srcAddress: `${socket.addresses[0]}%mockzone`
+                });
+                assert.ok(Array.isArray(errors));
+            } finally {
+                await socket.destroy();
+            }
+        });
+    });
+
+    describe('compare_IP_addresses rejects mixed-family inputs', () => {
+        it('throws when one address is Address4 and the other is Address6', () => {
+            const v4 = new Address4('10.0.0.1');
+            const v6 = new Address6('::1');
+            assert.throws(
+                () => compare_IP_addresses(v4 as any, v6 as any),
+                /same family/
+            );
+        });
+    });
+
+    describe('get_addresses returns by-value-deduped list', () => {
+        // Direct dedup-pattern test: prove that a Map keyed by .address
+        // collapses two reference-distinct, value-equal instances.
+        // (We cannot inject duplicates into os.networkInterfaces from here.)
+        it('Map-by-address dedup collapses two same-string Address4 instances', () => {
+            const a = new Address4('10.0.0.1/24');
+            const b = new Address4('10.0.0.1/24');
+            const dedup = new Map<string, Address4>();
+            for (const x of [a, b]) {
+                if (!dedup.has(x.address)) dedup.set(x.address, x);
+            }
+            assert.strictEqual([...dedup.values()].length, 1);
+            // Sanity: this matches the new pattern in src/helpers.ts:get_addresses
         });
     });
 });

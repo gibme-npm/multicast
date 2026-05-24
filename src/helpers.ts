@@ -48,32 +48,30 @@ export const detect_type = (address: Address4 | Address6 | string): SocketType =
  * Comparator for sorting IP addresses by their numeric value rather than
  * their string representation.
  *
+ * Both addresses must be of the same family (both Address4 or both Address6).
+ * Mixed-family input throws, because the underlying numeric ranges have no
+ * meaningful total order across families.
+ *
  * @param a - the first address to compare
  * @param b - the second address to compare
  * @returns `-1` if `a < b`, `0` if equal, `1` if `a > b`
+ * @throws Error if `a` and `b` are not of the same address family
  */
 export const compare_IP_addresses = (
     a: Address4 | Address6,
     b: Address4 | Address6
 ): -1 | 0 | 1 => {
+    const aIsV4 = a instanceof Address4;
+    const bIsV4 = b instanceof Address4;
+
+    if (aIsV4 !== bIsV4) {
+        throw new Error('compare_IP_addresses requires both addresses to be of the same family');
+    }
+
     const diff = a.bigInt() - b.bigInt();
 
     return diff === BigInt(0) ? 0 : diff < BigInt(0) ? -1 : 1;
 };
-
-/**
- * Converts a dotted-decimal netmask (e.g. `'255.255.255.0'`) to its CIDR prefix length.
- *
- * @param mask - the netmask in dotted-decimal notation
- * @returns the number of leading `1` bits (e.g. `24` for `'255.255.255.0'`)
- */
-const netmask_to_prefix = (mask: string): number =>
-    mask.split('.')
-        .map(Number)
-        .map(octet => octet.toString(2).padStart(8, '0'))
-        .join('')
-        .replace(/0+$/, '') // Remove trailing zeroes
-        .length;
 
 /**
  * Returns all non-internal network addresses on the system that match the
@@ -101,22 +99,29 @@ export const get_addresses = (
 
         for (const addr of ifaces[iface]) {
             if (addr.family === (type === 'udp4' ? 'IPv4' : 'IPv6') && !addr.internal) {
-                let address: Address4 | Address6;
-
-                const parseable = addr.cidr ? addr.cidr : `${addr.address}/${netmask_to_prefix(addr.netmask)}`;
-
-                if (type === 'udp4') {
-                    address = new Address4(parseable);
-                } else {
-                    address = new Address6(parseable);
+                if (!addr.cidr) {
+                    throw new Error(
+                        `Interface ${iface} address ${addr.address} is missing CIDR;` +
+                        ' Node 22+ should always populate addr.cidr');
                 }
+
+                const address: Address4 | Address6 = type === 'udp4'
+                    ? new Address4(addr.cidr)
+                    : new Address6(addr.cidr);
 
                 addresses.push(address);
             }
         }
     }
 
-    return [...new Set(addresses)];
+    // Dedup by the parsed address string. The previous `new Set(addresses)`
+    // here was a no-op because Set uses reference equality and every parsed
+    // Address4/Address6 above is a fresh instance.
+    const dedup = new Map<string, Address4 | Address6>();
+    for (const addr of addresses) {
+        if (!dedup.has(addr.address)) dedup.set(addr.address, addr);
+    }
+    return [...dedup.values()];
 };
 
 /**
@@ -133,6 +138,30 @@ export const is_valid_ip = (address: string): Address4 | Address6 | undefined =>
 
 const IPV4_LOOPBACK_SUBNET = new Address4('127.0.0.0/8');
 const IPV6_LINK_LOCAL_SUBNET = new Address6('fe80::/10');
+const IPV4_MULTICAST_SUBNET = new Address4('224.0.0.0/4');
+const IPV6_MULTICAST_SUBNET = new Address6('ff00::/8');
+
+/**
+ * Returns `true` if `address` is in the multicast range for its family.
+ *
+ * - IPv4: `224.0.0.0/4` per RFC 5771 (and RFC 1112 §4 originally).
+ * - IPv6: `ff00::/8` per RFC 4291 §2.7.
+ *
+ * Used to fail fast in `MulticastSocket.create` when the caller passes a
+ * non-multicast address as `multicastGroup`, before any socket allocation.
+ *
+ * @param address - the address string to test
+ * @param type - `'udp4'` or `'udp6'`
+ * @returns `true` if the address is a syntactically valid multicast address
+ */
+export const is_multicast = (address: string, type: SocketType): boolean => {
+    if (type === 'udp4') {
+        if (!Address4.isValid(address)) return false;
+        return new Address4(address).isInSubnet(IPV4_MULTICAST_SUBNET);
+    }
+    if (!Address6.isValid(address)) return false;
+    return new Address6(address).isInSubnet(IPV6_MULTICAST_SUBNET);
+};
 
 /**
  * Returns `true` if `remote` is on a local-link subnet of any non-internal interface
@@ -182,9 +211,13 @@ export const is_on_local_link = (remote: string, type: SocketType): boolean => {
     const addr = new Address6(addrStr);
 
     if (addr.isLoopback()) return true;
-    // Wider than Address6.isLinkLocal(): that method requires bits 10-63 to be zero
-    // (effectively fe80::/64). RFC 4291 reserves the entire fe80::/10 block for
-    // link-local unicast, so accept the full prefix range here.
+    // RFC 4291 §2.4 reserves the entire FE80::/10 prefix for Link-Local unicast,
+    // while §2.5.6 specifies the link-local address format with the middle 54
+    // bits set to zero (effectively fe80::/64). Address6.isLinkLocal() enforces
+    // the strict §2.5.6 format. For inbound source-address filtering the wider
+    // §2.4 reservation is the safer membership test: any address in FE80::/10
+    // is by definition not routable, so admitting the full prefix preserves
+    // §2.5.6-compliant peers without rejecting nonstandard-but-on-link forms.
     if (addr.isInSubnet(IPV6_LINK_LOCAL_SUBNET)) return true;
 
     for (const iface of get_addresses('udp6')) {

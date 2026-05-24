@@ -22,7 +22,14 @@ import { createSocket, RemoteInfo, Socket, SocketOptions, SocketType } from 'dgr
 import { AddressInfo } from 'net';
 import { EventEmitter } from 'events';
 import { Address4, Address6 } from 'ip-address';
-import { compare_IP_addresses, detect_type, get_addresses, is_on_local_link, is_valid_ip } from './helpers';
+import {
+    compare_IP_addresses,
+    detect_type,
+    get_addresses,
+    is_multicast,
+    is_on_local_link,
+    is_valid_ip
+} from './helpers';
 export { Address4, Address6 };
 
 export class MulticastSocket extends EventEmitter {
@@ -74,19 +81,56 @@ export class MulticastSocket extends EventEmitter {
     /**
      * Applies the inbound filters (`fromSelf` short-circuit and RFC 6762 §11
      * link-local origin check) and emits the appropriate event.
+     *
+     * RFC 6762 §11 carve-out: packets received with a destination address
+     * equal to the well-known link-local multicast group are "necessarily
+     * deemed to have originated on the local link, regardless of source IP
+     * address." Only the shared multicast socket calls `addMembership`, so it
+     * is the only socket that ever sees multicast-destination traffic. We
+     * discriminate by `local.address`: the multicast socket binds to the
+     * wildcard (`0.0.0.0` / `::`), the per-interface unicast sockets bind to
+     * specific interface addresses. Packets arriving on the wildcard skip the
+     * source-subnet check; packets arriving on a unicast bind still receive
+     * the check (which is the §11 unicast-destination rule).
      */
     private dispatch_message (message: Buffer, local: AddressInfo, rinfo: RemoteInfo): void {
-        const self = this.addresses.includes(rinfo.address);
+        const remoteBare = MulticastSocket.normalize_address(rinfo.address);
+        const self = this.addresses.includes(remoteBare);
 
         if (!this.options.loopback && self) return;
 
-        if (this.options.linkLocalOnly && !is_on_local_link(rinfo.address, this.type)) {
+        const arrivedOnMulticastSocket = MulticastSocket.is_wildcard_address(local.address);
+
+        if (
+            this.options.linkLocalOnly &&
+            !arrivedOnMulticastSocket &&
+            !is_on_local_link(rinfo.address, this.type)
+        ) {
             this.emit('drop', message, local, rinfo, 'off-link');
 
             return;
         }
 
         this.emit('message', message, local, rinfo, self);
+    }
+
+    /**
+     * Strips an IPv6 zone-id suffix (e.g. `%eth0`) from an address string for
+     * comparison against our bound addresses (which are stored without
+     * zone-ids). Used by `dispatch_message` for the fromSelf check and by
+     * `send`/`create` for `srcAddress` / `host` matching.
+     */
+    private static normalize_address (address: string): string {
+        return address.split('%')[0];
+    }
+
+    /**
+     * Returns true if `address` is the IPv4 or IPv6 wildcard bind. Used by
+     * `dispatch_message` to recognize packets arriving on the shared multicast
+     * socket (which is wildcard-bound).
+     */
+    private static is_wildcard_address (address: string): boolean {
+        return address === '0.0.0.0' || address === '::';
     }
 
     /**
@@ -115,6 +159,10 @@ export class MulticastSocket extends EventEmitter {
 
         const type = detect_type(options.multicastGroup);
 
+        if (!is_multicast(options.multicastGroup, type)) {
+            throw new Error(`multicastGroup ${options.multicastGroup} is not a multicast address`);
+        }
+
         const multicastInterfaces = (() => {
             const addresses = get_addresses(type);
             const _addresses = addresses.map(address => address.address.split('/')[0]);
@@ -125,6 +173,10 @@ export class MulticastSocket extends EventEmitter {
             if (typeof options.host !== 'string') {
                 options.host = options.host.address.split('/')[0];
             }
+
+            // Strip any IPv6 zone-id from the host string before parsing/matching;
+            // os.networkInterfaces() returns bare addresses without zone-ids.
+            options.host = MulticastSocket.normalize_address(options.host);
 
             const iface = is_valid_ip(options.host);
 
@@ -375,6 +427,12 @@ export class MulticastSocket extends EventEmitter {
      * Partial failures are collected rather than thrown. Use {@link Promise.allSettled} semantics
      * internally so that a failure on one interface does not prevent sending on others.
      *
+     * Concurrency note: combining `useMulticastSocket: true` with `srcAddress` mutates per-socket
+     * interface state on the shared multicast socket via `setMulticastInterface`. Two such calls
+     * issued without awaiting the first to complete will race and may send on the wrong
+     * interface. Serialize them in the caller, or omit `useMulticastSocket` (the default
+     * per-interface unicast path is race-free because each interface has its own socket).
+     *
      * @param message - the payload to send
      * @param options - optional send configuration
      * @returns an array of errors for any interfaces that failed to send (empty on full success)
@@ -394,6 +452,8 @@ export class MulticastSocket extends EventEmitter {
                     options.srcAddress = options.srcAddress.address.split('/')[0];
                 }
 
+                options.srcAddress = MulticastSocket.normalize_address(options.srcAddress);
+
                 if (!this.addresses.includes(options.srcAddress)) {
                     throw new Error(`Cannot use ${options.srcAddress} with multicast socket`);
                 }
@@ -404,6 +464,8 @@ export class MulticastSocket extends EventEmitter {
             if (typeof options.srcAddress !== 'string') {
                 options.srcAddress = options.srcAddress.address.split('/')[0];
             }
+
+            options.srcAddress = MulticastSocket.normalize_address(options.srcAddress);
 
             const candidate_socket = this.unicastSockets.get(options.srcAddress);
 
@@ -463,29 +525,16 @@ export class MulticastSocket extends EventEmitter {
     }
 
     /**
-     * Sets both the unicast TTL and the multicast TTL on every underlying socket
-     * (the shared multicast socket and each per-interface unicast socket).
+     * Sets or clears the `IP_MULTICAST_LOOP` socket option on the shared multicast socket.
+     * When set to `true`, multicast packets sent by this instance will also be delivered to
+     * its own `'message'` event listeners (with `fromSelf` set to `true`).
      *
-     * Propagating to the unicast sockets is required for RFC 6762 §11 outbound:
-     * `send()` uses them by default, so a value set only on the multicast socket
-     * would not affect default-path traffic.
-     *
-     * @param ttl - the time-to-live value (1-255)
-     */
-    public setTTL (ttl: number): void {
-        this.multicastSocket.setTTL(ttl);
-        this.multicastSocket.setMulticastTTL(ttl);
-
-        for (const [, socket] of this.unicastSockets) {
-            socket.setTTL(ttl);
-            socket.setMulticastTTL(ttl);
-        }
-    }
-
-    /**
-     * Sets or clears the `IP_MULTICAST_LOOP` socket option. When set to `true`, multicast
-     * packets sent by this instance will also be delivered to its own `'message'` event
-     * listeners (with `fromSelf` set to `true`).
+     * Implementation note: this only mutates `IP_MULTICAST_LOOP` on the shared multicast
+     * socket; the per-interface unicast sockets retain their OS-default loopback. The
+     * authoritative gate for whether the caller sees its own packets is the
+     * `loopback` check inside `dispatch_message`, which reads `options.loopback` that
+     * this method updates. The user-visible contract is therefore honored regardless of
+     * the kernel-level state on the unicast sockets.
      *
      * @param loopback - whether to enable multicast loopback
      */
@@ -636,6 +685,12 @@ export namespace MulticastSocket {
              * If `true`, sends the packet via the shared multicast socket instead of the
              * per-interface unicast sockets. Combine with `srcAddress` to control which
              * interface the multicast socket uses; without it, the OS chooses the interface.
+             *
+             * Concurrency caveat: when `useMulticastSocket` and `srcAddress` are combined,
+             * the call sequence `setMulticastInterface(srcAddress)` then `send(...)` mutates
+             * per-socket state on the shared multicast socket. Concurrent calls with
+             * different `srcAddress` values will race. Serialize them in the caller or use
+             * the default per-interface unicast path, which is race-free.
              * @default false
              */
             useMulticastSocket?: boolean;

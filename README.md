@@ -71,12 +71,17 @@ The socket type (`udp4` / `udp6`) is detected automatically from the `multicastG
 
 ### RFC 6762 §11 (off-link defense)
 
-Out of the box, this library applies both halves of RFC 6762 §11 to defend against off-link injection of multicast traffic (the threat motivates protocols like mDNS):
+This library applies both halves of RFC 6762 §11 to defend against off-link injection of multicast traffic (the threat motivates protocols like mDNS):
 
-* Outbound: every underlying socket (the shared multicast socket and each per-interface unicast socket) is configured with `IP_MULTICAST_TTL = 255` at bind time, so all multicast sends leave at TTL 255 regardless of which send path `send()` picks.
-* Inbound: received packets whose source address is not on a local-link subnet of any interface this host owns are dropped before the `'message'` event fires. Dropped packets surface as the `'drop'` event with reason `'off-link'`. Disable with `linkLocalOnly: false` if you need to receive multicast across routed segments.
+* **Outbound** (RFC 6762 §11 first paragraph, SHOULD): every underlying socket (the shared multicast socket and each per-interface unicast socket) is configured with `IP_MULTICAST_TTL = 255` and `IP_TTL = 255` at bind time. The library does not expose a runtime override — TTL is hardcoded to 255 by design, because the §11 verification on receivers depends on it being exactly 255.
+* **Inbound** (RFC 6762 §11 second paragraph, MUST): received packets are filtered by source address unless `linkLocalOnly: false` is set. Dropped packets surface as the `'drop'` event with reason `'off-link'`.
 
-The inbound check is a source-address subnet approximation: true §11 wants `IP_TTL === 255` on inbound, but Node's `dgram.Socket` does not expose the received TTL (no `IP_RECVTTL` / `IPV6_RECVHOPLIMIT` ancillary data). The subnet filter is the no-native-deps interim; a future native-addon `recvmsg` receive path could enforce TTL = 255 literally.
+Two important details on the inbound check:
+
+* **Approximation, not literal.** RFC 6762 §11 specifies the canonical inbound check as `IP_TTL === 255` on the received packet. Node's `dgram.Socket` does not expose the received TTL (no `IP_RECVTTL` / `IPV6_RECVHOPLIMIT` ancillary data), so the library uses a source-address subnet check as a no-native-deps interim. A source-address subnet check does not catch on-link-IP source spoofing the way a TTL check would, so this is genuinely weaker than literal §11. There is no plan to work around this — the dgram TTL gap is upstream.
+* **§11 multicast-destination exemption.** Per §11 itself: "All responses received with a destination address in the IP header that is the mDNS IPv4 link-local multicast address 224.0.0.251 or the mDNS IPv6 link-local multicast address FF02::FB are necessarily deemed to have originated on the local link, regardless of source IP address." The library implements this exemption by skipping the source-subnet check on packets received via the shared multicast socket (the only socket joined to the group, and therefore the only socket that receives multicast-destination traffic). Packets received via a per-interface unicast socket — i.e. unicast-destination traffic — still receive the source-subnet check. The trade-off: the exemption permits the cross-subnet-overlay traffic that the spec explicitly addresses, but it relies on multicast routing/switching to keep off-link traffic out of the group. Hosts behind misconfigured multicast routers may receive off-link multicast that the (unavailable) IP_TTL=255 check would have caught.
+
+Disable the inbound filter with `linkLocalOnly: false` if you need to receive multicast across routed segments deliberately (e.g. SSDP over Layer 3, multicast across VPN tunnels).
 
 ## API
 
@@ -117,10 +122,6 @@ Closes all underlying sockets, drops multicast group membership, and removes all
 ### `socket.close(): Promise<void>`
 
 Closes all underlying sockets and drops multicast group membership but does **not** remove event listeners. Prefer `destroy()` for full cleanup.
-
-### `socket.setTTL(ttl: number): void`
-
-Sets both the unicast TTL and multicast TTL on the underlying multicast socket.
 
 ### `socket.setMulticastLoopback(loopback: boolean): void`
 
