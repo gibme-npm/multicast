@@ -13,6 +13,11 @@ from all underlying unicast sockets.</p>
 </div></section><section class="tsd-panel tsd-member"><h3 class="tsd-anchor-link" id="usemulticastsocket"><code class="tsd-tag">Optional</code><span>use<wbr/>Multicast<wbr/>Socket</span><a href="#usemulticastsocket" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h3><div class="tsd-signature"><span class="tsd-kind-property">useMulticastSocket</span><span class="tsd-signature-symbol">?:</span> <span class="tsd-signature-type">boolean</span></div><div class="tsd-comment tsd-typography"><p>If <code>true</code>, sends the packet via the shared multicast socket instead of the
 per-interface unicast sockets. Combine with <code>srcAddress</code> to control which
 interface the multicast socket uses; without it, the OS chooses the interface.</p>
+<p>Concurrency caveat: when <code>useMulticastSocket</code> and <code>srcAddress</code> are combined,
+the call sequence <code>setMulticastInterface(srcAddress)</code> then <code>send(...)</code> mutates
+per-socket state on the shared multicast socket. Concurrent calls with
+different <code>srcAddress</code> values will race. Serialize them in the caller or use
+the default per-interface unicast path, which is race-free.</p>
 </div><div class="tsd-comment tsd-typography"><div class="tsd-tag-default"><h4 class="tsd-anchor-link" id="default">Default<a href="#default" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="../assets/icons.svg#icon-anchor"></use></svg></a></h4><pre><code class="ts"><span class="hl-6">false</span>
 </code><button type="button">Copy</button></pre>
 
